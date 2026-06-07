@@ -7,6 +7,7 @@ export interface AccountRecord {
   phone: string;
   username?: string;
   telegram_id?: string;
+  session?: string;
   created_at: number;
 }
 

@@ -1,11 +1,8 @@
 import { Api, TelegramClient } from 'telegram';
-import { StoreSession } from 'telegram/sessions/index.js';
+import { StringSession } from 'telegram/sessions/index.js';
 import { computeCheck } from 'telegram/Password.js';
-import { mkdirSync } from 'fs';
-import { join } from 'path';
 
 import {
-  sessionsDir,
   AccountRecord,
   getAccount,
   upsertAccount,
@@ -41,12 +38,6 @@ function apiCreds(): { apiId: number; apiHash: string } {
   );
 }
 
-function sessionPathFor(accountId: string): string {
-  const dir = join(sessionsDir, accountId);
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
 const clientCache = new Map<string, TelegramClient>();
 
 export class TelegramAuthError extends Error {
@@ -61,7 +52,8 @@ export async function clientForAccount(accountId: string): Promise<TelegramClien
   if (cached) return cached;
 
   const { apiId, apiHash } = apiCreds();
-  const session = new StoreSession(sessionPathFor(accountId));
+  const account = getAccount(accountId);
+  const session = new StringSession(account?.session || '');
   const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
   await client.connect();
 
@@ -99,7 +91,7 @@ const pending = new Map<string, PendingLogin>();
 
 export async function loginStart(authId: string, phone: string): Promise<void> {
   const { apiId, apiHash } = apiCreds();
-  const session = new StoreSession(join(sessionsDir, `_pending_${authId}`));
+  const session = new StringSession('');
   const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 3 });
   await client.connect();
   const result = await client.sendCode({ apiId, apiHash }, phone);
@@ -149,24 +141,27 @@ async function finalizeLogin(authId: string, entry: PendingLogin): Promise<Accou
   const username = (me as any)?.username as string | undefined;
   const accountId = telegramId || `acct_${Date.now()}`;
 
-  // Promote the pending session to its permanent location.
-  const finalDir = sessionPathFor(accountId);
-  const { apiId, apiHash } = apiCreds();
-  const finalSession = new StoreSession(finalDir);
-  await finalSession.load();
-  const src = entry.client.session as any;
-  (finalSession as any).setDC?.(src.dcId, src.serverAddress, src.port);
-  (finalSession as any).setAuthKey?.(src.authKey);
-  await finalSession.save();
+  // Extract the session string from the pending client.
+  const pendingSession = entry.client.session as StringSession;
+  const sessionString = pendingSession.save();
 
   await entry.client.disconnect();
 
-  const promoted = new TelegramClient(finalSession, apiId, apiHash, { connectionRetries: 5 });
-  await promoted.connect();
-  clientCache.set(accountId, promoted);
+  // Create a new client with the same session data.
+  const { apiId, apiHash } = apiCreds();
+  const finalSession = new StringSession(sessionString);
+  const client = new TelegramClient(finalSession, apiId, apiHash, { connectionRetries: 5 });
+  await client.connect();
+  clientCache.set(accountId, client);
 
-  void authId; // pending dir is left on disk; harmless, can be GC'd later
-  return upsertAccount({ id: accountId, phone: entry.phone, username, telegram_id: telegramId });
+  void authId;
+  return upsertAccount({
+    id: accountId,
+    phone: entry.phone,
+    username,
+    telegram_id: telegramId,
+    session: sessionString,
+  });
 }
 
 export function getAccountSafe(id: string): AccountRecord | undefined {
